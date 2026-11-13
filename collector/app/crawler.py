@@ -5,10 +5,16 @@ Concurrency and rate-limit contract:
 * Only one collection round may run at a time (``round_lock``).
 * At most two HTTP requests are in flight at any moment, across both columns
   (a single shared ``asyncio.Semaphore(2)``).
-* A 429 with a ``Retry-After`` integer header pauses the *whole site*: every
-  later request, including the retry itself and requests of the other column,
-  waits in :meth:`_pass_gate`. Further 429s only extend the pause. Requests
-  already in flight are allowed to finish.
+* A 429 pauses the *whole site* as soon as its **response headers** arrive:
+  the cooldown is extended by the integer ``Retry-After`` and the error
+  response is closed immediately, without waiting for a slow or stalled
+  error body (or the request timeout). Every later request — retries of both
+  columns and every hop of a same-site redirect chain — waits in
+  :meth:`_pass_gate`. Further 429s only extend the pause. Requests already
+  in flight are allowed to finish.
+* Redirects are followed manually, hop by hop, each hop passing the
+  site-wide gate. Only relative / same-site redirects are followed. Redirect
+  hops never consume page attempts and never reset the per-page retry count.
 * Every page (list or detail) is attempted at most three times. Exhausted
   retries and permanently unparseable pages are recorded as unfinished, so a
   round is never reported as successful in that case.
@@ -16,6 +22,8 @@ Concurrency and rate-limit contract:
   requests and the connection pool, and only then flips the state to stopped
   and permits a new round. A round id guards against a late response from the
   old round being written into the new one.
+* Every request (including 429s and redirect hops) is appended to a bounded
+  request-time log with wall-clock time, status and duration.
 """
 
 from __future__ import annotations
@@ -25,6 +33,7 @@ import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+from urllib.parse import urljoin, urlparse
 
 import httpx
 
@@ -33,13 +42,30 @@ from .parser import ListParseResult, ParseError
 
 MAX_ATTEMPTS = 3
 MAX_IN_FLIGHT = 2
+MAX_REDIRECT_HOPS = 5
 GATE_POLL_SECONDS = 0.25
 EVENT_LOG_LIMIT = 200
+REQUEST_LOG_LIMIT = 300
 DEFAULT_RETRY_AFTER_SECONDS = 5
 
 
 class RoundStopped(Exception):
     """Raised inside a round when cooperative stop has been requested."""
+
+
+class SiteThrottled(Exception):
+    """A 429 was received; the site-wide cooldown has already been extended."""
+
+    def __init__(self, url: str, wait_seconds: int):
+        super().__init__(
+            f"429 Too Many Requests on {url}; site-wide cooldown {wait_seconds}s"
+        )
+        self.url = url
+        self.wait_seconds = wait_seconds
+
+
+class RedirectError(Exception):
+    """Redirect chain is unusable (too many hops or leaves the target site)."""
 
 
 @dataclass
@@ -64,6 +90,15 @@ class UnfinishedPage:
 
 
 @dataclass
+class RequestLogEntry:
+    at: str  # wall-clock time the request completed (UTC)
+    url: str
+    status: int | None  # None when the request never got a response
+    duration_ms: int
+    note: str = ""
+
+
+@dataclass
 class RoundState:
     round_id: str | None = None
     status: str = "idle"  # idle | running | stopping | stopped | completed | partial
@@ -79,6 +114,7 @@ class RoundState:
     sections: dict[str, SectionProgress] = field(default_factory=dict)
     unfinished: list[UnfinishedPage] = field(default_factory=list)
     events: list[str] = field(default_factory=list)
+    request_log: list[RequestLogEntry] = field(default_factory=list)
 
 
 class Crawler:
@@ -122,6 +158,20 @@ class Crawler:
         self.state.events.append(f"{stamp} {message}")
         del self.state.events[:-EVENT_LOG_LIMIT]
 
+    def _log_request(
+        self, url: str, status: int | None, started: float, note: str = ""
+    ) -> None:
+        self.state.request_log.append(
+            RequestLogEntry(
+                at=datetime.now(timezone.utc).strftime("%H:%M:%S.%f")[:-3],
+                url=self._absolute(url),
+                status=status,
+                duration_ms=int((time.monotonic() - started) * 1000),
+                note=note,
+            )
+        )
+        del self.state.request_log[:-REQUEST_LOG_LIMIT]
+
     # ------------------------------------------------------------- lifecycle
     async def start_round(self) -> str:
         async with self._round_lock:
@@ -145,12 +195,7 @@ class Crawler:
             )
             # Limits created before this round do not apply to the new one:
             # a fresh client also guarantees a fresh connection pool.
-            self._client = httpx.AsyncClient(
-                base_url=self.base_url,
-                timeout=httpx.Timeout(self.timeout),
-                headers={"User-Agent": "procurement-collector/1.0"},
-                follow_redirects=True,
-            )
+            self._client = self._new_client()
             self._log(f"round {round_id} started; columns={list(self.sections)}")
             self._round_task = asyncio.create_task(self._run_round(round_id))
             return round_id
@@ -184,13 +229,18 @@ class Crawler:
                 pass
 
             # Rebuild a closed client so the next round owns a clean pool.
-            self._client = httpx.AsyncClient(
-                base_url=self.base_url,
-                timeout=httpx.Timeout(self.timeout),
-                headers={"User-Agent": "procurement-collector/1.0"},
-                follow_redirects=True,
-            )
+            self._client = self._new_client()
             self._log("in-flight requests closed and connections recycled; round stopped")
+
+    def _new_client(self) -> httpx.AsyncClient:
+        # follow_redirects=False on purpose: redirects are followed manually
+        # hop by hop so every hop passes the site-wide cooldown gate.
+        return httpx.AsyncClient(
+            base_url=self.base_url,
+            timeout=httpx.Timeout(self.timeout),
+            headers={"User-Agent": "procurement-collector/1.0"},
+            follow_redirects=False,
+        )
 
     # ----------------------------------------------------------------- round
     async def _run_round(self, round_id: str) -> None:
@@ -374,41 +424,38 @@ class Crawler:
     async def _get_parsed_page(self, round_id: str, job: dict, parse_func):
         """Fetch one URL with up to three attempts, then parse it.
 
-        Transport errors and HTTP error statuses (including 429 after cooldown)
-        consume attempts; a page whose HTML never parses within three attempts
-        surfaces the last :class:`ParseError`.
+        Transport errors, throttling (429), redirect failures and HTTP error
+        statuses all consume attempts; a page whose HTML never parses within
+        three attempts surfaces the last :class:`ParseError`. Redirect hops
+        inside an attempt never touch the attempt counter.
         """
         last_error: Exception | None = None
         while job["attempts"] < MAX_ATTEMPTS:
             job["attempts"] += 1
-            await self._pass_gate(round_id)  # may raise RoundStopped
-            if round_id != self._round_id:
-                raise RoundStopped("round superseded before request")
             try:
-                async with self._inflight:
-                    assert self._client is not None
-                    response = await self._client.get(job["url"])
+                response = await self._get_page(round_id, job["url"])
+            except RoundStopped:
+                raise
+            except SiteThrottled as exc:
+                # Cooldown already extended when the 429 headers arrived.
+                last_error = exc
+                self._log(
+                    f"throttled ({job['attempts']}/{MAX_ATTEMPTS}) {job['url']}: "
+                    f"retry waits for the site-wide cooldown"
+                )
+                continue
+            except RedirectError as exc:
+                last_error = exc
+                self._log(
+                    f"redirect error ({job['attempts']}/{MAX_ATTEMPTS}) {job['url']}: {exc}"
+                )
+                continue
             except httpx.RequestError as exc:
                 last_error = exc
                 if self._stop_event.is_set():
                     raise RoundStopped("in-flight request closed by stop")
                 self._log(
                     f"request error ({job['attempts']}/{MAX_ATTEMPTS}) {job['url']}: {exc}"
-                )
-                continue
-
-            # The request itself has finished: 429 only gates *later* traffic.
-            if response.status_code == 429:
-                wait_seconds = self._retry_after_seconds(response)
-                self._extend_cooldown(wait_seconds)
-                last_error = httpx.HTTPStatusError(
-                    f"429 Too Many Requests; site-wide cooldown {wait_seconds}s",
-                    request=response.request,
-                    response=response,
-                )
-                self._log(
-                    f"429 on {job['url']}; whole site pauses {wait_seconds}s "
-                    f"(attempt {job['attempts']}/{MAX_ATTEMPTS})"
                 )
                 continue
 
@@ -433,6 +480,72 @@ class Crawler:
                 continue
 
         raise last_error if last_error else ParseError("unknown failure")
+
+    async def _get_page(self, round_id: str, url: str) -> httpx.Response:
+        """One page attempt: GET *url*, following same-site redirects hop by hop.
+
+        Every hop passes the site-wide gate, so a redirect chain that is
+        interrupted by a 429 waits out the cooldown before its next hop.
+        Redirect hops do not consume page attempts and never reset the
+        per-page retry counter.
+        """
+        current = self._absolute(url)
+        for _ in range(MAX_REDIRECT_HOPS + 1):
+            response = await self._send_once(round_id, current)
+            if not response.is_redirect:
+                return response
+            location = response.headers["location"]
+            next_url = urljoin(current, location)
+            if urlparse(next_url).netloc != urlparse(self.base_url).netloc:
+                raise RedirectError(f"cross-site redirect refused: {location}")
+            self._log(f"redirect {current} -> {location}")
+            current = next_url
+        raise RedirectError(f"too many redirects (>{MAX_REDIRECT_HOPS}) for {url}")
+
+    async def _send_once(self, round_id: str, url: str) -> httpx.Response:
+        """Send one GET after passing the site-wide gate.
+
+        A 429 is acted upon as soon as its *headers* arrive: the cooldown is
+        extended by the integer ``Retry-After`` and the error response is
+        closed immediately — a slow or stalled error body can no longer
+        delay or be missed by the cooldown, and the request timeout never
+        applies to it. Normal in-flight responses are read to completion.
+        """
+        await self._pass_gate(round_id)  # may raise RoundStopped
+        if round_id != self._round_id:
+            raise RoundStopped("round superseded before request")
+        async with self._inflight:
+            assert self._client is not None
+            request = self._client.build_request("GET", url)
+            started = time.monotonic()
+            try:
+                response = await self._client.send(request, stream=True)
+            except httpx.RequestError as exc:
+                self._log_request(url, None, started, f"transport error: {type(exc).__name__}")
+                raise
+            if response.status_code == 429:
+                wait_seconds = self._retry_after_seconds(response)
+                self._extend_cooldown(wait_seconds)
+                # Close the error response right away; never wait for its body.
+                await response.aclose()
+                self._log_request(
+                    url, 429, started,
+                    f"headers arrived -> cooldown +{wait_seconds}s; error body skipped",
+                )
+                self._log(
+                    f"429 on {self._absolute(url)}; whole site pauses {wait_seconds}s "
+                    f"(headers only, body not read)"
+                )
+                raise SiteThrottled(url, wait_seconds)
+            try:
+                await response.aread()
+            except httpx.RequestError:
+                await response.aclose()
+                self._log_request(url, response.status_code, started, "body read failed")
+                raise
+            await response.aclose()  # release the connection back to the pool
+            self._log_request(url, response.status_code, started)
+            return response
 
     async def _pass_gate(self, round_id: str) -> None:
         """Block while stop is requested or a site-wide cooldown is active."""

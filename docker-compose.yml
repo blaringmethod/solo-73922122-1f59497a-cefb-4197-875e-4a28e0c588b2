@@ -11,6 +11,12 @@ services:
       SITE_RATE_WINDOW: "10"
       SITE_LATENCY_MS: "150"
       SITE_RETRY_AFTER: "5"
+      # 429 failure modes (also switchable at runtime via /admin):
+      # slow-transmit error body (ms) and stalled error body (never ends).
+      SITE_SLOW_429_MS: "0"
+      SITE_STALLED_429: "false"
+      # Same-site redirect hops before each content page (0 = off).
+      SITE_REDIRECT_HOPS: "0"
     ports:
       - "8080:8080"
     healthcheck:

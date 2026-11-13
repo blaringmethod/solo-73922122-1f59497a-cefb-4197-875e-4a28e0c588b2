@@ -71,6 +71,7 @@ async def download_records():
         "finished_at": state["finished_at"],
         "records_count": len(crawler.records()),
         "unfinished_pages": state["unfinished"],
+        "request_log": state["request_log"],
         "records": crawler.records(),
     }
     headers = {
@@ -113,6 +114,10 @@ async def site_proxy(path: str, request: Request):
         raise HTTPException(status_code=502, detail=f"procurement site unreachable: {exc}") from exc
     excluded = {"content-encoding", "transfer-encoding", "connection"}
     headers = {k: v for k, v in upstream.headers.items() if k.lower() not in excluded}
+    # Keep redirects inside the same-origin proxy (e.g. the /admin 303s).
+    location = headers.get("location")
+    if location and location.startswith("/"):
+        headers["location"] = "/site" + location
     content_type = upstream.headers.get("content-type", "")
     if "application/json" in content_type:
         return JSONResponse(upstream.json(), status_code=upstream.status_code, headers=headers)

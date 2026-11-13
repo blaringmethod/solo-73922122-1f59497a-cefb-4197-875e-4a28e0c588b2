@@ -79,8 +79,9 @@
         <a class="btn-site" href="/site/admin" target="_blank" rel="noopener">⚙ 采购站限流/延迟开关</a>
       </div>
       <p class="muted" style="margin-bottom:0;margin-top:10px">
-        目标站点：<span id="baseUrl"></span> ｜ 栏目：招标公告 / 中标公告 ｜ 每页最多尝试 3 次，
-        429 按 Retry-After 整站冷却。
+        目标站点：<span id="baseUrl"></span> ｜ 栏目：招标公告 / 中标公告 ｜ 每页最多尝试 3 次 ｜
+        429 响应头到达即按 Retry-After 整站冷却并关闭错误响应（不等慢传/断流正文）｜
+        重试与同站跳转每一跳均遵守冷却。
       </p>
     </section>
 
@@ -103,6 +104,16 @@
     <section class="panel">
       <h2>分栏目进度</h2>
       <div class="section-grid" id="sections"></div>
+    </section>
+
+    <section class="panel">
+      <h2>请求时间记录（采集器侧，最新在后；429 记响应头到达时刻，跳转逐跳记录）</h2>
+      <div class="table-wrap" style="max-height:240px">
+        <table>
+          <thead><tr><th>时间(UTC)</th><th>URL</th><th>状态</th><th>耗时(ms)</th><th>备注</th></tr></thead>
+          <tbody id="reqlogBody"><tr><td colspan="5" class="muted">暂无</td></tr></tbody>
+        </table>
+      </div>
     </section>
 
     <section class="panel">
@@ -176,6 +187,19 @@
          <td><a href="${r.url}" target="_blank" rel="noopener">链接</a></td></tr>`).join("");
     }
 
+    function renderRequestLog(rows) {
+      const body = $("reqlogBody");
+      if (!rows.length) {
+        body.innerHTML = '<tr><td colspan="5" class="muted">暂无</td></tr>';
+        return;
+      }
+      body.innerHTML = rows.slice(-60).map(r =>
+        `<tr class="${r.status === 429 ? "warn" : ""}"><td>${r.at}</td>
+         <td style="word-break:break-all">${escapeHtml(r.url)}</td>
+         <td>${r.status === null ? "—" : r.status}</td><td>${r.duration_ms}</td>
+         <td class="muted">${escapeHtml(r.note || "")}</td></tr>`).join("");
+    }
+
     async function loadRecords() {
       const resp = await fetch("/api/records");
       const data = await resp.json();
@@ -210,6 +234,7 @@
       $("finishedAt").textContent = s.finished_at ? s.finished_at.replace("T", " ").slice(0, 19) : "—";
       renderSections(s.sections);
       renderUnfinished(s.unfinished);
+      renderRequestLog(s.request_log || []);
       $("events").innerHTML = s.events.slice().reverse().map(e =>
         `<div class="${e.includes("429") || e.includes("unfinished") || e.includes("error") ? "warn" : ""}">${escapeHtml(e)}</div>`).join("");
       await loadRecords();
