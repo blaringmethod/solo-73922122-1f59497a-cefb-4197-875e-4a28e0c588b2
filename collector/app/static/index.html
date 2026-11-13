@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>公共采购公告采集台</title>
+  <style>
+    :root {
+      --bg: #0f172a; --panel: #1e293b; --line: #334155; --text: #e2e8f0;
+      --muted: #94a3b8; --accent: #38bdf8; --green: #34d399; --red: #f87171;
+      --amber: #fbbf24;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+           background: var(--bg); color: var(--text); }
+    header { padding: 20px 28px; border-bottom: 1px solid var(--line);
+             display: flex; align-items: center; justify-content: space-between; }
+    header h1 { margin: 0; font-size: 20px; }
+    main { padding: 24px 28px; max-width: 1180px; margin: 0 auto; }
+    .panel { background: var(--panel); border: 1px solid var(--line);
+             border-radius: 10px; padding: 18px 20px; margin-bottom: 18px; }
+    .panel h2 { margin: 0 0 14px; font-size: 15px; color: var(--accent); }
+    .controls { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+    button { border: none; border-radius: 8px; padding: 10px 22px; font-size: 14px;
+             cursor: pointer; font-weight: 600; }
+    button:disabled { opacity: .45; cursor: not-allowed; }
+    .btn-start { background: var(--green); color: #052e1f; }
+    .btn-stop { background: var(--red); color: #3b0a0a; }
+    .btn-download { background: var(--accent); color: #08233a; }
+    .btn-site { background: #475569; color: #fff; text-decoration: none;
+                padding: 10px 18px; border-radius: 8px; font-size: 14px; font-weight: 600; }
+    .badge { display: inline-block; padding: 4px 12px; border-radius: 999px;
+             font-size: 13px; font-weight: 700; }
+    .badge.idle { background: #475569; }
+    .badge.running { background: #0369a1; }
+    .badge.stopping { background: #b45309; }
+    .badge.stopped { background: #b91c1c; }
+    .badge.completed { background: #047857; }
+    .badge.partial { background: #a16207; }
+    .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+    .stat { background: #0b1220; border: 1px solid var(--line); border-radius: 8px;
+            padding: 12px 14px; }
+    .stat .label { color: var(--muted); font-size: 12px; }
+    .stat .value { font-size: 22px; font-weight: 700; margin-top: 4px; }
+    .cooldown { color: var(--amber); font-weight: 700; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); }
+    th { color: var(--muted); font-weight: 600; }
+    .section-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+    .section-card { background: #0b1220; border: 1px solid var(--line);
+                    border-radius: 8px; padding: 14px; }
+    .section-card h3 { margin: 0 0 10px; font-size: 14px; }
+    .kv { display: flex; justify-content: space-between; font-size: 13px;
+          padding: 3px 0; color: var(--muted); }
+    .kv b { color: var(--text); }
+    .events { font-family: ui-monospace, monospace; font-size: 12px;
+              max-height: 220px; overflow-y: auto; background: #0b1220;
+              border: 1px solid var(--line); border-radius: 8px; padding: 10px; }
+    .events div { padding: 2px 0; }
+    .warn { color: var(--red); }
+    .muted { color: var(--muted); font-size: 12px; }
+    a { color: var(--accent); }
+    .table-wrap { max-height: 360px; overflow: auto; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>📋 公共采购公告采集台</h1>
+    <span id="statusBadge" class="badge idle">空闲 idle</span>
+  </header>
+  <main>
+    <section class="panel">
+      <h2>采集控制（单进程同时仅允许一轮，全站在途请求 ≤ 2）</h2>
+      <div class="controls">
+        <button id="btnStart" class="btn-start">▶ 启动一轮采集</button>
+        <button id="btnStop" class="btn-stop" disabled>■ 停止</button>
+        <button id="btnDownload" class="btn-download">⬇ 下载 JSON</button>
+        <a class="btn-site" href="/site/" target="_blank" rel="noopener">🌐 打开本地采购站（新标签页）</a>
+        <a class="btn-site" href="/site/admin" target="_blank" rel="noopener">⚙ 采购站限流/延迟开关</a>
+      </div>
+      <p class="muted" style="margin-bottom:0;margin-top:10px">
+        目标站点：<span id="baseUrl"></span> ｜ 栏目：招标公告 / 中标公告 ｜ 每页最多尝试 3 次，
+        429 按 Retry-After 整站冷却。
+      </p>
+    </section>
+
+    <section class="panel">
+      <h2>实时进度</h2>
+      <div class="grid">
+        <div class="stat"><div class="label">已入队页面</div><div class="value" id="enqueued">0</div></div>
+        <div class="stat"><div class="label">已完成页面</div><div class="value" id="completed">0</div></div>
+        <div class="stat"><div class="label">失败页面</div><div class="value" id="failed" style="color:var(--red)">0</div></div>
+        <div class="stat"><div class="label">已提取公告（按编号去重）</div><div class="value" id="records">0</div></div>
+      </div>
+      <p style="margin:14px 0 0">
+        全站冷却剩余：<span id="cooldown" class="cooldown">0.0 s</span>
+        ｜ 轮次：<span id="roundId" class="muted">—</span>
+        ｜ 开始：<span id="startedAt" class="muted">—</span>
+        ｜ 结束：<span id="finishedAt" class="muted">—</span>
+      </p>
+    </section>
+
+    <section class="panel">
+      <h2>分栏目进度</h2>
+      <div class="section-grid" id="sections"></div>
+    </section>
+
+    <section class="panel">
+      <h2>未完成页面（耗尽 3 次尝试或解析失败时列入；存在未完成页则本轮不算成功）</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>栏目</th><th>类型</th><th>页/编号</th><th>尝试次数</th><th>原因</th><th>URL</th></tr></thead>
+          <tbody id="unfinishedBody"><tr><td colspan="6" class="muted">暂无</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>已提取公告</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>公告编号</th><th>标题</th><th>采购单位</th><th>截止日期</th><th>来源栏目</th></tr></thead>
+          <tbody id="recordsBody"><tr><td colspan="5" class="muted">暂无数据</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>事件日志</h2>
+      <div class="events" id="events"></div>
+    </section>
+  </main>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    let timer = null;
+    let lastStatus = "";
+
+    function setStatus(s) {
+      const badge = $("statusBadge");
+      const labels = {
+        idle: "空闲 idle", running: "采集中 running", stopping: "停止中 stopping",
+        stopped: "已停止 stopped", completed: "已完成 completed", partial: "部分成功 partial"
+      };
+      badge.textContent = labels[s] || s;
+      badge.className = "badge " + s;
+      const busy = s === "running" || s === "stopping";
+      $("btnStart").disabled = busy;
+      $("btnStop").disabled = s !== "running";
+    }
+
+    function renderSections(sections) {
+      const box = $("sections");
+      box.innerHTML = "";
+      for (const [name, p] of Object.entries(sections)) {
+        const card = document.createElement("div");
+        card.className = "section-card";
+        card.innerHTML = `<h3>${name}</h3>
+          <div class="kv"><span>列表总页数</span><b>${p.list_total_pages}</b></div>
+          <div class="kv"><span>列表完成 / 失败</span><b>${p.list_completed} / ${p.list_failed}</b></div>
+          <div class="kv"><span>详情入队 / 完成 / 失败</span><b>${p.detail_enqueued} / ${p.detail_completed} / ${p.detail_failed}</b></div>
+          <div class="kv"><span>重复编号跳过</span><b>${p.duplicated_skipped}</b></div>`;
+        box.appendChild(card);
+      }
+    }
+
+    function renderUnfinished(rows) {
+      const body = $("unfinishedBody");
+      if (!rows.length) {
+        body.innerHTML = '<tr><td colspan="6" class="muted">暂无</td></tr>';
+        return;
+      }
+      body.innerHTML = rows.map(r =>
+        `<tr class="warn"><td>${r.section}</td><td>${r.page_type}</td><td>${r.page}</td>
+         <td>${r.attempts}</td><td>${escapeHtml(r.reason)}</td>
+         <td><a href="${r.url}" target="_blank" rel="noopener">链接</a></td></tr>`).join("");
+    }
+
+    async function loadRecords() {
+      const resp = await fetch("/api/records");
+      const data = await resp.json();
+      const body = $("recordsBody");
+      if (!data.records.length) {
+        body.innerHTML = '<tr><td colspan="5" class="muted">暂无数据</td></tr>';
+        return;
+      }
+      body.innerHTML = data.records.map(r =>
+        `<tr><td>${r.announcement_code}</td><td>${escapeHtml(r.title)}</td>
+         <td>${escapeHtml(r.procurement_unit)}</td><td>${r.deadline}</td><td>${r.section}</td></tr>`).join("");
+      $("records").textContent = data.count;
+    }
+
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g, c =>
+        ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+    }
+
+    async function refresh() {
+      const resp = await fetch("/api/state");
+      const s = await resp.json();
+      setStatus(s.status);
+      $("baseUrl").textContent = s.base_url;
+      $("enqueued").textContent = s.pages_enqueued;
+      $("completed").textContent = s.pages_completed;
+      $("failed").textContent = s.pages_failed;
+      $("records").textContent = s.records_count;
+      $("cooldown").textContent = s.cooldown_remaining_seconds + " s";
+      $("roundId").textContent = s.round_id || "—";
+      $("startedAt").textContent = s.started_at ? s.started_at.replace("T", " ").slice(0, 19) : "—";
+      $("finishedAt").textContent = s.finished_at ? s.finished_at.replace("T", " ").slice(0, 19) : "—";
+      renderSections(s.sections);
+      renderUnfinished(s.unfinished);
+      $("events").innerHTML = s.events.slice().reverse().map(e =>
+        `<div class="${e.includes("429") || e.includes("unfinished") || e.includes("error") ? "warn" : ""}">${escapeHtml(e)}</div>`).join("");
+      await loadRecords();
+      if (s.status !== "running" && s.status !== "stopping" && timer) {
+        clearInterval(timer); timer = null;
+      }
+    }
+
+    async function start() {
+      const resp = await fetch("/api/rounds", { method: "POST" });
+      if (!resp.ok) { alert("启动失败：" + (await resp.json()).detail); return; }
+      if (!timer) timer = setInterval(refresh, 1000);
+      refresh();
+    }
+    async function stop() {
+      $("btnStop").disabled = true;
+      const resp = await fetch("/api/rounds/stop", { method: "POST" });
+      if (!resp.ok) { alert("停止失败"); }
+      refresh();
+    }
+
+    $("btnStart").addEventListener("click", start);
+    $("btnStop").addEventListener("click", stop);
+    $("btnDownload").addEventListener("click", () => {
+      window.location.href = "/api/records/download";
+    });
+    refresh();
+    timer = setInterval(refresh, 2000);
+  </script>
+</body>
+</html>

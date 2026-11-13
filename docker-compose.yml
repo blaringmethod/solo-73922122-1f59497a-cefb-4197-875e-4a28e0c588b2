@@ -1,0 +1,39 @@
+services:
+  procurement-site:
+    build:
+      context: ./site
+    container_name: procurement-site
+    environment:
+      # Sliding-window limiter: at most SITE_RATE_LIMIT requests per
+      # SITE_RATE_WINDOW seconds; 429 carries an integer Retry-After.
+      SITE_RATE_ENABLED: "true"
+      SITE_RATE_LIMIT: "12"
+      SITE_RATE_WINDOW: "10"
+      SITE_LATENCY_MS: "150"
+      SITE_RETRY_AFTER: "5"
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  collector:
+    build:
+      context: ./collector
+    container_name: procurement-collector
+    depends_on:
+      procurement-site:
+        condition: service_healthy
+    environment:
+      TARGET_BASE_URL: "http://procurement-site:8080"
+      SECTION_TENDER_PATH: "/tenders"
+      SECTION_AWARD_PATH: "/awards"
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
